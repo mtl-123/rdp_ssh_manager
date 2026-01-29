@@ -1,0 +1,108 @@
+name: 构建rdp_ssh_manager二进制文件
+
+# 核心修复：放宽触发规则，确保能命中
+on:
+  # 1. 推送到任意分支（测试阶段），后续可改回main/master
+  push:
+    branches: ["*"]
+    # 修复：匹配main.go的实际路径（如果main.go在根目录则保留，若在rdp_ssh_manager/下需调整）
+    paths:
+      - "main.go"                # 根目录的main.go
+      - "rdp_ssh_manager/main.go" # 兼容子目录的main.go
+      - ".github/workflows/build.yml"
+  # 2. PR触发（可选）
+  pull_request:
+    branches: ["main", "master"]
+    paths:
+      - "main.go"
+      - "rdp_ssh_manager/main.go"
+      - ".github/workflows/build.yml"
+  # 3. 手动触发（兜底，确保能手动运行）
+  workflow_dispatch:
+
+jobs:
+  build-linux-amd64:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: 配置Go环境
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+          cache-dependency-path: |
+            go.sum
+            rdp_ssh_manager/go.sum # 兼容子目录的依赖文件
+
+      - name: 安装系统依赖
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y file fzf sshpass xfreerdp3
+          sudo apt-get clean
+
+      - name: 进入代码目录（关键：适配main.go的实际位置）
+        run: |
+          # 检测main.go位置，自动进入对应目录
+          if [ -f "rdp_ssh_manager/main.go" ]; then
+            cd rdp_ssh_manager
+            echo "WORK_DIR=rdp_ssh_manager" >> $GITHUB_ENV
+          else
+            echo "WORK_DIR=." >> $GITHUB_ENV
+          fi
+
+      - name: 初始化Go模块&整理依赖
+        run: |
+          cd ${{ env.WORK_DIR }}
+          # 初始化模块（替换为你的GitHub仓库地址）
+          if [ ! -f "go.mod" ]; then
+            go mod init github.com/你的用户名/rdp_ssh_manager
+          fi
+          go mod tidy
+          go list -m all
+
+      - name: 编译静态二进制
+        run: |
+          cd ${{ env.WORK_DIR }}
+          # 定义编译变量
+          BIN_NAME="rdp_ssh_manager"
+          BIN_PATH="../bin/${BIN_NAME}" # 输出到根目录的bin文件夹
+          BUILD_VERSION="v1.0.0"
+          BUILD_COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+          BUILD_TIME=$(date +"%Y-%m-%d %H:%M:%S")
+
+          # 创建输出目录
+          mkdir -p ../bin
+
+          # 静态编译（适配你的代码依赖）
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+          go build -ldflags "\
+            -s -w \
+            -extldflags '-static' \
+            -X main.version=${BUILD_VERSION} \
+            -X main.commit=${BUILD_COMMIT} \
+            -X main.buildTime=${BUILD_TIME} \
+          " -trimpath -o "${BIN_PATH}" main.go
+
+          # 验证编译结果
+          ls -lh ../bin/
+          file "${BIN_PATH}"
+
+      - name: 验证二进制可执行性
+        run: |
+          chmod +x bin/rdp_ssh_manager
+          # 打印版本/帮助（如果你的程序支持）
+          ./bin/rdp_ssh_manager --version || echo "二进制文件生成成功（无--version参数）"
+
+      - name: 上传编译产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: rdp_ssh_manager-linux-amd64
+          path: bin/rdp_ssh_manager
+          retention-days: 30
+          if-no-files-found: error
