@@ -1,242 +1,132 @@
-name: Build & Release Static Binary
+name: 构建Linux静态二进制（rdp_ssh_manager）
 
+# 触发条件：推送到main/master分支、PR到main/master分支、手动触发
 on:
   push:
-    branches: [master]
-    tags: ["v*"]
-  workflow_dispatch:
+    branches: [ main, master ]
+    paths:
+      - "main.go"
+      - ".github/workflows/build.yml" # 仅当代码或工作流文件变更时触发
+  pull_request:
+    branches: [ main, master ]
+    paths:
+      - "main.go"
+      - ".github/workflows/build.yml"
+  workflow_dispatch: # 手动触发按钮
 
-permissions:
-  contents: write
-  packages: write
-  actions: read
-  id-token: write
-
+# 作业定义
 jobs:
-  build-linux-x86_64-static:
-    name: Build Linux x86_64 Static
-    runs-on: ubuntu-22.04
+  build-linux-amd64:
+    # 运行环境：最新版Ubuntu
+    runs-on: ubuntu-latest
+    timeout-minutes: 15 # 超时时间，避免无限运行
+
     steps:
-      - name: Checkout Source Code
+      # 步骤1：检出代码到工作目录
+      - name: 检出代码
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 1 # 仅拉取最新提交，加速
 
-      # 安装Go环境（适配Go语言编译）
-      - name: Install Go Toolchain
+      # 步骤2：设置Go环境（匹配项目依赖的版本）
+      - name: 配置Go环境
         uses: actions/setup-go@v5
         with:
-          go-version: stable # 使用稳定版Go，也可指定具体版本如1.22.x
-          cache: true # 启用Go模块缓存，加速构建
+          go-version: '1.22' # 建议使用项目实际依赖的Go版本（1.19+均可）
+          cache: true # 缓存Go模块，加速后续构建
+          cache-dependency-path: go.sum # 依赖缓存依据
 
-      # 安装系统依赖（保留UPX等工具）
-      - name: Install System Dependencies
+      # 步骤3：安装系统依赖（用于验证静态链接的file工具）
+      - name: 安装系统依赖
         run: |
-          set -euo pipefail
-          sudo apt update -y || true
-          sudo apt install -y --no-install-recommends \
-            build-essential \
-            gh \
-            upx-ucl
-          # 验证工具
-          go version
-          gcc --version
-          gh --version
-          upx --version || echo "UPX版本检查完成"
-          echo "✅ 系统依赖安装成功（包含UPX）"
+          sudo apt-get update -y
+          sudo apt-get install -y file # 用于检测二进制文件链接类型
+          sudo apt-get clean # 清理缓存，减少空间占用
 
-      # Go静态编译（适配Go的编译参数）
-      - name: Build Static Binary
+      # 步骤4：初始化Go模块并整理依赖（核心修复模块匹配问题）
+      - name: 初始化Go Module并整理依赖
         run: |
-          set -euo pipefail
+          # 初始化模块（替换为你的GitHub仓库地址，可自定义）
+          if [ ! -f "go.mod" ]; then
+            go mod init github.com/your-username/rdp_ssh_manager
+          fi
+          # 自动整理依赖（拉取缺失的、清理无用的）
+          go mod tidy
+          # 打印依赖信息，便于调试
+          go list -m all
+
+      # 步骤5：静态编译Go二进制文件（核心编译逻辑）
+      - name: 编译Linux AMD64静态二进制
+        run: |
+          # 定义变量
           BIN_NAME="rdp_ssh_manager"
           BIN_PATH="bin/${BIN_NAME}"
+          BUILD_VERSION="v1.0.0"
+          BUILD_COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+          BUILD_TIME=$(date +"%Y-%m-%d %H:%M:%S")
 
           # 创建输出目录
           mkdir -p bin
 
-          # Go静态编译参数（关键：CGO_ENABLED=0 禁用CGO实现纯静态）
+          # 静态编译（CGO_ENABLED=0 禁用CGO，纯静态）
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
           go build -ldflags "\
             -s -w \
             -extldflags '-static' \
-            -X main.version=${{ github.ref_name || github.sha }} \
-          " -trimpath -o "${BIN_PATH}" ./...
+            -X main.version=${BUILD_VERSION} \
+            -X main.commit=${BUILD_COMMIT} \
+            -X main.buildTime=${BUILD_TIME} \
+          " -trimpath -o "${BIN_PATH}" main.go
 
-          # 验证产物
+          # 打印编译后文件信息
           ls -lh bin/
+
+      # 步骤6：验证二进制文件是否生成
+      - name: 验证二进制文件存在性
+        run: |
+          BIN_NAME="rdp_ssh_manager"
+          BIN_PATH="bin/${BIN_NAME}"
           if [ ! -f "$BIN_PATH" ]; then
-            echo "FATAL: 二进制文件未生成！"
+            echo "FATAL: 二进制文件未生成！路径：${BIN_PATH}"
             exit 1
           fi
-          # 验证静态链接（Go CGO_ENABLED=0 编译默认纯静态）
-          file "$BIN_PATH" | grep -qi "statically linked" || {
-            echo "WARNING: 未完全静态链接，但仍可运行"
+          echo "✅ 二进制文件生成成功：$(ls -lh ${BIN_PATH})"
+
+      # 步骤7：验证静态链接（确保无动态依赖）
+      - name: 验证静态链接特性
+        run: |
+          BIN_NAME="rdp_ssh_manager"
+          BIN_PATH="bin/${BIN_NAME}"
+          # 检测是否为静态链接
+          if file "$BIN_PATH" | grep -qi "statically linked"; then
+            echo "✅ 二进制文件为纯静态链接"
+          else
+            echo "WARNING: 二进制文件非纯静态链接，但仍尝试继续"
+            # 打印详细文件信息，便于排查
             file "$BIN_PATH"
-          }
-          echo "✅ Go静态编译成功"
-
-      # 验证原始二进制可运行
-      - name: Verify Original Binary Runability
-        run: |
-          set -euo pipefail
-          BIN_NAME="rdp_ssh_manager"
-          BIN_PATH="bin/${BIN_NAME}"
-
-          chmod +x "$BIN_PATH"
-          echo "=== 测试原始二进制基础功能 ==="
-          # 适配Go程序的帮助参数（根据实际程序调整，如-h/--help）
-          if ! "$BIN_PATH" -h > /dev/null 2>&1; then
-            echo "ERROR: 原始二进制运行失败！"
-            "$BIN_PATH" -h 2>&1
-            exit 1
+            ldd "$BIN_PATH" || true
           fi
-          echo "✅ 原始二进制运行测试通过"
 
-      # UPX压缩（逻辑与原流程一致）
-      - name: Compress Binary with UPX-UCL
-        id: upx_compress
-        run: |
-          set -euo pipefail
-          BIN_NAME="rdp_ssh_manager"
-          BIN_PATH="bin/${BIN_NAME}"
-          
-          # 备份原始二进制
-          cp "$BIN_PATH" "${BIN_PATH}.backup"
-          
-          # 记录压缩前体积
-          echo "=== UPX压缩前体积 ==="
-          ls -lh "$BIN_PATH"
-          ORIG_SIZE=$(du -b "$BIN_PATH" | awk '{print $1}')
-          
-          # UPX压缩（适配Go静态二进制的参数）
-          upx --best --lzma --force --strip-relocs=0 -q "$BIN_PATH" || {
-            echo "WARNING: UPX压缩失败，使用原始二进制"
-            cp "${BIN_PATH}.backup" "$BIN_PATH"
-            echo "compressed=false" >> $GITHUB_OUTPUT
-            exit 0
-          }
-          
-          # 记录压缩后体积
-          echo "=== UPX压缩后体积 ==="
-          ls -lh "$BIN_PATH"
-          COMP_SIZE=$(du -b "$BIN_PATH" | awk '{print $1}')
-          COMP_RATIO=$(echo "scale=2; $COMP_SIZE/$ORIG_SIZE*100" | bc)
-          echo "压缩率: ${COMP_RATIO}% (原始: $ORIG_SIZE 字节, 压缩后: $COMP_SIZE 字节)"
-          
-          # 清理备份
-          rm -f "${BIN_PATH}.backup"
-          echo "compressed=true" >> $GITHUB_OUTPUT
-          echo "✅ UPX压缩完成"
-
-      # 验证压缩后二进制可运行（增加容错）
-      - name: Verify Compressed Binary Runability
-        run: |
-          set -euo pipefail
-          BIN_NAME="rdp_ssh_manager"
-          BIN_PATH="bin/${BIN_NAME}"
-          BACKUP_PATH="${BIN_PATH}.backup"
-
-          chmod +x "$BIN_PATH"
-          echo "=== 测试UPX压缩后二进制基础功能 ==="
-          if ! "$BIN_PATH" -h > /dev/null 2>&1; then
-            echo "WARNING: 压缩后二进制运行失败，回滚到原始二进制"
-            if [ -f "$BACKUP_PATH" ]; then
-              cp "$BACKUP_PATH" "$BIN_PATH"
-            fi
-            # 重新验证原始二进制
-            if ! "$BIN_PATH" -h > /dev/null 2>&1; then
-              echo "ERROR: 原始二进制也无法运行！"
-              "$BIN_PATH" -h 2>&1
-              exit 1
-            fi
-            echo "✅ 已回滚到原始二进制，运行测试通过"
-          else
-            echo "✅ 压缩后二进制运行测试通过"
-          fi
-          rm -f "$BACKUP_PATH"
-
-      # 打包（适配Go程序命名，区分Tag/非Tag）
-      - name: Package (RDP_SSH_Manager Naming)
-        id: package
-        run: |
-          set -euo pipefail
-          mkdir -p release
-          BIN_NAME="rdp_ssh_manager"
-          
-          # 区分Tag/非Tag命名
-          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
-            # Tag推送（正式版本）
-            VERSION="${{ github.ref_name }}"
-            if [ "${{ steps.upx_compress.outputs.compressed }}" == "false" ]; then
-              FINAL_BIN="rdp_ssh_manager-${VERSION}-linux-x86_64-static"
-            else
-              FINAL_BIN="rdp_ssh_manager-${VERSION}-linux-x86_64-static-upx"
-            fi
-          else
-            # 非Tag推送（开发版本）
-            COMMIT_SHA="${{ github.sha }}"
-            SHORT_SHA="${COMMIT_SHA:0:8}"
-            if [ "${{ steps.upx_compress.outputs.compressed }}" == "false" ]; then
-              FINAL_BIN="rdp_ssh_manager-dev-${SHORT_SHA}-linux-x86_64-static"
-            else
-              FINAL_BIN="rdp_ssh_manager-dev-${SHORT_SHA}-linux-x86_64-static-upx"
-            fi
-            VERSION="dev-${SHORT_SHA}"
-          fi
-          
-          # 复制二进制并生成校验和
-          cp bin/${BIN_NAME} release/${FINAL_BIN}
-          chmod +x release/${FINAL_BIN}
-          sha256sum release/${FINAL_BIN} | awk '{print $1 "  " $2}' > release/${FINAL_BIN}.sha256
-
-          # 输出变量
-          echo "final_bin=release/${FINAL_BIN}" >> $GITHUB_OUTPUT
-          echo "final_sum=release/${FINAL_BIN}.sha256" >> $GITHUB_OUTPUT
-          echo "version=${VERSION}" >> $GITHUB_OUTPUT
-
-          # 打印产物信息
-          echo "=== 最终产物 ==="
-          ls -lh release/
-          cat release/${FINAL_BIN}.sha256
-
-      # 上传Artifact
-      - name: Upload Artifact
+      # 步骤8：上传编译产物（便于下载使用）
+      - name: 上传编译产物到Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: rdp_ssh_manager-linux-x86_64-static-${{ steps.package.outputs.version }}
-          path: release/
-          retention-days: 30
-          if-no-files-found: error
+          name: rdp_ssh_manager-linux-amd64-${{ github.sha }} # 产物名称包含提交哈希
+          path: bin/rdp_ssh_manager # 要上传的文件路径
+          retention-days: 30 # 产物保留30天，可按需调整
+          if-no-files-found: error # 无文件时标记为失败
 
-      # 发布到GitHub Releases（仅Tag推送时执行）
-      - name: Publish to GitHub Releases
-        if: startsWith(github.ref, 'refs/tags/')
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          # 验证gh权限
-          gh auth status
-          # 验证文件存在
-          if [ ! -f "${{ steps.package.outputs.final_bin }}" ] || [ ! -f "${{ steps.package.outputs.final_sum }}" ]; then
-            echo "FATAL: Release files missing!"
-            ls -lh release/
-            exit 1
-          fi
-          # 构建Release标题
-          if [ "${{ steps.upx_compress.outputs.compressed }}" == "false" ]; then
-            RELEASE_TITLE="Release ${{ steps.package.outputs.version }} (Static Binary)"
-          else
-            RELEASE_TITLE="Release ${{ steps.package.outputs.version }} (Static Binary, UPX Compressed)"
-          fi
-          # 创建Release
-          gh release create ${{ steps.package.outputs.version }} \
-            --title "$RELEASE_TITLE" \
-            --generate-notes \
-            --repo ${{ github.repository }} \
-            ${{ steps.package.outputs.final_bin }} \
-            ${{ steps.package.outputs.final_sum }}
-          # 验证发布
-          echo "✅ Release published successfully!"
-          gh release view ${{ steps.package.outputs.version }} --repo ${{ github.repository }} --json assets --jq '.assets[].name'
+      # 可选步骤：发布Release（如需自动创建Release，取消注释以下配置）
+      # - name: 创建GitHub Release
+      #   if: github.event_name == 'push' && github.ref == 'refs/heads/main' # 仅主分支推送时触发
+      #   uses: softprops/action-gh-release@v2
+      #   with:
+      #     tag_name: v1.0.0-${{ github.sha }}
+      #     name: rdp_ssh_manager-v1.0.0-${{ github.sha }}
+      #     files: bin/rdp_ssh_manager
+      #     body: |
+      #       自动构建的Linux AMD64静态二进制
+      #       提交哈希：${{ github.sha }}
+      #       构建时间：${{ github.run_at }}
+      #   env:
+      #     GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # GitHub自动生成的Token，无需手动配置
