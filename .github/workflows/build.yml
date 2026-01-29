@@ -224,38 +224,42 @@ jobs:
 
       # 修复3：优化Release发布逻辑，增加前置校验+强制续跑，确保触发即执行
       - name: Publish to GitHub Releases
-        if: startsWith(github.ref, 'refs/tags/')  # 仅Tag推送触发，严格匹配v*
-        continue-on-error: false  # 发布失败则标记流程失败，便于排查
+        if: startsWith(github.ref, 'refs/tags/') && startsWith(github.ref_name, 'v')
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # GitHub自动注入，无需手动配置
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          # 前置校验：确保gh命令可用+权限正常
-          gh auth status || { echo "ERROR: gh命令认证失败"; exit 1; }
-          # 二次校验产物文件
-          if [ ! -f "${{ steps.package.outputs.final_bin }}" ] || [ ! -f "${{ steps.package.outputs.final_sum }}" ]; then
-            echo "FATAL: Release产物文件缺失！"
+          echo "=== 开始发布到GitHub Releases ==="
+          echo "当前Tag: ${{ github.ref_name }}"
+          echo "产物路径: ${{ steps.package.outputs.final_bin }}"
+          echo "校验和路径: ${{ steps.package.outputs.final_sum }}"
+
+          # 严格校验产物文件是否存在
+          if [ ! -f "${{ steps.package.outputs.final_bin }}" ]; then
+            echo "ERROR: 二进制产物缺失！路径：${{ steps.package.outputs.final_bin }}"
             ls -lh release/
             exit 1
           fi
-          # 定义发布标题
-          if [ "${{ steps.upx_compress.outputs.compressed }}" == "false" ]; then
-            RELEASE_TITLE="Release ${{ steps.package.outputs.version }} (Static Binary)"
-          else
-            RELEASE_TITLE="Release ${{ steps.package.outputs.version }} (Static Binary, UPX Compressed)"
+          if [ ! -f "${{ steps.package.outputs.final_sum }}" ]; then
+            echo "ERROR: 校验和文件缺失！路径：${{ steps.package.outputs.final_sum }}"
+            ls -lh release/
+            exit 1
           fi
-          # 强制创建Release（覆盖同名Tag，避免重复发布报错）
-          gh release create ${{ steps.package.outputs.version }} \
-            --title "$RELEASE_TITLE" \
+
+          # 核心修复：先删除远程同名Release（若存在），避免"Tag已存在"报错
+          # gh release delete 无则跳过，--yes 自动确认删除，无需交互
+          gh release delete ${{ github.ref_name }} --yes 2>/dev/null || echo "⚠️  无同名Release，直接创建新Release"
+
+          # 重新创建Release（移除--force，使用gh原生支持的合法参数）
+          # --draft=false 强制正式发布，--prerelease=false 非预发布，适配所有gh版本
+          gh release create ${{ github.ref_name }} \
+            --title "Release ${{ github.ref_name }} (Linux x86_64 Static)" \
             --generate-notes \
-            --repo ${{ github.repository }} \
-            --force \
+            --draft=false \
+            --prerelease=false \
             ${{ steps.package.outputs.final_bin }} \
             ${{ steps.package.outputs.final_sum }}
-          # 验证发布结果
-          echo "✅ Release发布成功！"
-          gh release view ${{ steps.package.outputs.version }} --repo ${{ github.repository }} --json assets --jq '.assets[].name'
 
-
-
-          
+          # 发布后验证+打印访问地址
+          echo "✅ 发布成功！Releases地址：https://github.com/${{ github.repository }}/releases/tag/${{ github.ref_name }}"
+          gh release view ${{ github.ref_name }} --json assets --jq '.assets[] | {name: .name, downloadUrl: .browser_download_url}'
