@@ -3,8 +3,8 @@ name: Build & Release Static Binary
 on:
   push:
     branches: [master]
-    tags: ["v*"]
-  workflow_dispatch:
+    tags: ["v*"]  # 仅匹配v开头的标签（如v1.0.0、v2.1.3，严格区分大小写）
+  workflow_dispatch:  # 手动触发兜底，支持任意分支/Tag手动发布
 
 permissions:
   contents: write
@@ -16,17 +16,21 @@ jobs:
   build-linux-x86_64-static:
     name: Build Linux x86_64 Static
     runs-on: ubuntu-22.04
+    timeout-minutes: 20  # 延长超时时间，避免构建中断
     steps:
       - name: Checkout Source Code
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 0  # 拉取完整Git历史，避免git rev-parse等命令报错
 
+      # 修复1：彻底移除非法toolchain参数，使用setup-go合法参数配置Go环境
       - name: Install Go Toolchain
         uses: actions/setup-go@v5
         with:
-          toolchain: stable
-          cache: true
+          go-version: "stable"  # 合法参数：指定Go稳定版（等效原toolchain: stable）
+          cache: true           # 启用Go模块缓存（自动兼容首次构建，无缓存则跳过）
+          architecture: x64     # 匹配x86_64架构，与编译目标一致
+          # 移除cache-dependency-path，使用默认缓存规则（自动检测go.sum）
 
       - name: Install System Dependencies
         run: |
@@ -43,6 +47,7 @@ jobs:
           upx --version || echo "UPX版本检查完成"
           echo "✅ 系统依赖安装成功（包含UPX）"
 
+      # 修复2：提前初始化Go Module，确保go.sum生成，为缓存提供依赖文件
       - name: Initialize Go Module & Tidy Dependencies
         run: |
           set -euo pipefail
@@ -51,8 +56,14 @@ jobs:
             go mod init ${MODULE_NAME}
             echo "✅ 已初始化Go Module: ${MODULE_NAME}"
           fi
-          go mod tidy
-          echo "✅ 第三方依赖整理完成，已生成/更新go.sum"
+          # 强制整理依赖，确保生成/更新go.sum（关键：为后续缓存提供文件）
+          go mod tidy -v
+          # 验证依赖文件存在
+          if [ -f "go.sum" ]; then
+            echo "✅ go.sum文件生成成功，缓存可用"
+          else
+            echo "⚠️  go.sum文件未生成，本次缓存失效（不影响构建）"
+          fi
           go list -m all
 
       - name: Build Static Binary
@@ -84,15 +95,13 @@ jobs:
           strip --strip-all "$BIN_PATH"
           echo "✅ 静态编译成功（已strip）"
 
-      # ========== 核心修复：优化二进制验证逻辑，解决卡顿超时 ==========
       - name: Verify Original Binary Runability
         run: |
           set -euo pipefail
           BIN_NAME="rdp_ssh_manager"
           BIN_PATH="bin/${BIN_NAME}"
-          TIMEOUT_SEC=10  # 超时时间，避免无限阻塞
+          TIMEOUT_SEC=10
 
-          # 1. 基础校验：文件存在+可执行权限（核心必要校验）
           if [ ! -f "$BIN_PATH" ]; then
             echo "FATAL: 二进制文件不存在！"
             exit 1
@@ -104,8 +113,6 @@ jobs:
           fi
 
           echo "=== 测试原始二进制基础功能（带超时保护）==="
-          # 2. 带超时的轻量检测：优先尝试--version，失败则尝试-h，均失败则跳过（非致命）
-          # 使用timeout命令限制执行时间，避免阻塞；输出重定向避免无关日志干扰
           if timeout ${TIMEOUT_SEC}s "$BIN_PATH" --version >/dev/null 2>&1; then
             echo "✅ 二进制--version检测通过"
           elif timeout ${TIMEOUT_SEC}s "$BIN_PATH" -h >/dev/null 2>&1; then
@@ -144,26 +151,22 @@ jobs:
           echo "compressed=true" >> $GITHUB_OUTPUT
           echo "✅ UPX压缩完成"
 
-      # ========== 同步优化：压缩后二进制验证逻辑 ==========
       - name: Verify Compressed Binary Runability
         run: |
           set -euo pipefail
           BIN_NAME="rdp_ssh_manager"
           BIN_PATH="bin/${BIN_NAME}"
           BACKUP_PATH="${BIN_PATH}.backup"
-          TIMEOUT_SEC=10  # 统一超时时间
+          TIMEOUT_SEC=10
 
           chmod +x "$BIN_PATH"
           echo "=== 测试UPX压缩后二进制基础功能（带超时保护）==="
-          # 带超时检测，失败则回滚
           if ! (timeout ${TIMEOUT_SEC}s "$BIN_PATH" --version >/dev/null 2>&1 || timeout ${TIMEOUT_SEC}s "$BIN_PATH" -h >/dev/null 2>&1); then
             echo "⚠️  压缩后二进制检测无响应，回滚到原始二进制"
-            # 回滚到备份的原始二进制
             if [ -f "$BACKUP_PATH" ]; then
               cp "$BACKUP_PATH" "$BIN_PATH"
               chmod +x "$BIN_PATH"
             fi
-            # 回滚后仅校验文件可执行性（不做命令检测，避免再次阻塞）
             if [ ! -x "$BIN_PATH" ]; then
               echo "ERROR: 原始二进制也无执行权限！"
               exit 1
@@ -172,7 +175,6 @@ jobs:
           else
             echo "✅ 压缩后二进制基础有效性测试通过"
           fi
-          # 清理备份
           rm -f "$BACKUP_PATH"
 
       - name: Package (RDP_SSH_Manager Naming)
@@ -220,28 +222,36 @@ jobs:
           retention-days: 30
           if-no-files-found: error
 
+      # 修复3：优化Release发布逻辑，增加前置校验+强制续跑，确保触发即执行
       - name: Publish to GitHub Releases
-        if: startsWith(github.ref, 'refs/tags/')
+        if: startsWith(github.ref, 'refs/tags/')  # 仅Tag推送触发，严格匹配v*
+        continue-on-error: false  # 发布失败则标记流程失败，便于排查
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # GitHub自动注入，无需手动配置
         run: |
           set -euo pipefail
-          gh auth status
+          # 前置校验：确保gh命令可用+权限正常
+          gh auth status || { echo "ERROR: gh命令认证失败"; exit 1; }
+          # 二次校验产物文件
           if [ ! -f "${{ steps.package.outputs.final_bin }}" ] || [ ! -f "${{ steps.package.outputs.final_sum }}" ]; then
-            echo "FATAL: Release files missing!"
+            echo "FATAL: Release产物文件缺失！"
             ls -lh release/
             exit 1
           fi
+          # 定义发布标题
           if [ "${{ steps.upx_compress.outputs.compressed }}" == "false" ]; then
             RELEASE_TITLE="Release ${{ steps.package.outputs.version }} (Static Binary)"
           else
             RELEASE_TITLE="Release ${{ steps.package.outputs.version }} (Static Binary, UPX Compressed)"
           fi
+          # 强制创建Release（覆盖同名Tag，避免重复发布报错）
           gh release create ${{ steps.package.outputs.version }} \
             --title "$RELEASE_TITLE" \
             --generate-notes \
             --repo ${{ github.repository }} \
+            --force \
             ${{ steps.package.outputs.final_bin }} \
             ${{ steps.package.outputs.final_sum }}
-          echo "✅ Release published successfully!"
+          # 验证发布结果
+          echo "✅ Release发布成功！"
           gh release view ${{ steps.package.outputs.version }} --repo ${{ github.repository }} --json assets --jq '.assets[].name'
