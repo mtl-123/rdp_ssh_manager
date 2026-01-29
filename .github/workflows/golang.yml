@@ -56,30 +56,33 @@ jobs:
           go list -m all
 
       # 步骤5：静态编译Go二进制文件（核心编译逻辑）
-      - name: 编译Linux AMD64静态二进制
+      - name: 编译静态二进制
         run: |
-          # 定义变量
+          cd ${{ env.WORK_DIR }}
+          # 定义编译变量
           BIN_NAME="rdp_ssh_manager"
-          BIN_PATH="bin/${BIN_NAME}"
+          BIN_PATH="../bin/${BIN_NAME}" # 输出到根目录的bin文件夹
           BUILD_VERSION="v1.0.0"
           BUILD_COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
           BUILD_TIME=$(date +"%Y-%m-%d %H:%M:%S")
 
           # 创建输出目录
-          mkdir -p bin
+          mkdir -p ../bin
 
-          # 静态编译（CGO_ENABLED=0 禁用CGO，纯静态）
+          # ========== 关键修复：1. 补全ldflags格式 2. 兼容无变量的情况 ==========
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-          go build -ldflags "\
+          go build -ldflags " \
             -s -w \
             -extldflags '-static' \
             -X main.version=${BUILD_VERSION} \
             -X main.commit=${BUILD_COMMIT} \
-            -X main.buildTime=${BUILD_TIME} \
+            -X 'main.buildTime=${BUILD_TIME}' \
           " -trimpath -o "${BIN_PATH}" main.go
 
-          # 打印编译后文件信息
-          ls -lh bin/
+          # 验证编译结果
+          ls -lh ../bin/
+          file "${BIN_PATH}"
+        shell: /usr/bin/bash -e {0}
 
       # 步骤6：验证二进制文件是否生成
       - name: 验证二进制文件存在性
