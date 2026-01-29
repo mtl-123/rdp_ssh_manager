@@ -1,108 +1,255 @@
-name: 构建rdp_ssh_manager二进制文件
+name: Build & Release Static Binary
 
-# 核心修复：放宽触发规则，确保能命中
 on:
-  # 1. 推送到任意分支（测试阶段），后续可改回main/master
   push:
-    branches: ["*"]
-    # 修复：匹配main.go的实际路径（如果main.go在根目录则保留，若在rdp_ssh_manager/下需调整）
-    paths:
-      - "main.go"                # 根目录的main.go
-      - "rdp_ssh_manager/main.go" # 兼容子目录的main.go
-      - ".github/workflows/build.yml"
-  # 2. PR触发（可选）
-  pull_request:
-    branches: ["main", "master"]
-    paths:
-      - "main.go"
-      - "rdp_ssh_manager/main.go"
-      - ".github/workflows/build.yml"
-  # 3. 手动触发（兜底，确保能手动运行）
+    branches: [master]
+    tags: ["v*"]
   workflow_dispatch:
 
-jobs:
-  build-linux-amd64:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+permissions:
+  contents: write
+  packages: write
+  actions: read
+  id-token: write
 
+jobs:
+  build-linux-x86_64-static:
+    name: Build Linux x86_64 Static
+    runs-on: ubuntu-22.04
     steps:
-      - name: 检出代码
+      - name: Checkout Source Code
         uses: actions/checkout@v4
         with:
-          fetch-depth: 1
+          fetch-depth: 0
 
-      - name: 配置Go环境
+      # 安装基础Go工具链（替换Rust工具链，匹配原流程步骤名）
+      - name: Install Go Toolchain
         uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
-          cache: true
-          cache-dependency-path: |
-            go.sum
-            rdp_ssh_manager/go.sum # 兼容子目录的依赖文件
+          toolchain: stable # 使用Go稳定版，等效Rust stable
+          cache: true # 启用Go模块缓存，加速构建
 
-      - name: 安装系统依赖
+      # 安装系统依赖（保留UPX，移除Rust专属依赖，匹配原流程）
+      - name: Install System Dependencies
         run: |
-          sudo apt-get update -y
-          sudo apt-get install -y file fzf sshpass xfreerdp3
-          sudo apt-get clean
+          set -euo pipefail
+          sudo apt update -y || true
+          sudo apt install -y --no-install-recommends \
+            build-essential \
+            gh \
+            file \
+            upx-ucl  # 保留UPX压缩工具，移除libc6-dev（Go无需）
+          # 验证工具（替换Rust验证为Go验证，匹配原流程）
+          gcc --version
+          gh --version
+          go version
+          upx --version || echo "UPX版本检查完成"
+          echo "✅ 系统依赖安装成功（包含UPX）"
 
-      - name: 进入代码目录（关键：适配main.go的实际位置）
+      # Go静态编译（核心步骤，修复ldflags语法，匹配原流程验证逻辑）
+      - name: Build Static Binary
         run: |
-          # 检测main.go位置，自动进入对应目录
-          if [ -f "rdp_ssh_manager/main.go" ]; then
-            cd rdp_ssh_manager
-            echo "WORK_DIR=rdp_ssh_manager" >> $GITHUB_ENV
-          else
-            echo "WORK_DIR=." >> $GITHUB_ENV
-          fi
-
-      - name: 初始化Go模块&整理依赖
-        run: |
-          cd ${{ env.WORK_DIR }}
-          # 初始化模块（替换为你的GitHub仓库地址）
-          if [ ! -f "go.mod" ]; then
-            go mod init github.com/你的用户名/rdp_ssh_manager
-          fi
-          go mod tidy
-          go list -m all
-
-      - name: 编译静态二进制
-        run: |
-          cd ${{ env.WORK_DIR }}
-          # 定义编译变量
+          set -euo pipefail
           BIN_NAME="rdp_ssh_manager"
-          BIN_PATH="../bin/${BIN_NAME}" # 输出到根目录的bin文件夹
-          BUILD_VERSION="v1.0.0"
-          BUILD_COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
-          BUILD_TIME=$(date +"%Y-%m-%d %H:%M:%S")
+          BIN_PATH="bin/${BIN_NAME}" # Go编译输出目录，替代Rust的target/release
 
           # 创建输出目录
-          mkdir -p ../bin
+          mkdir -p bin
 
-          # 静态编译（适配你的代码依赖）
+          # Go静态编译核心参数（禁用CGO实现纯静态，修复ldflags语法错误）
+          # -s -w：移除调试信息和符号表，瘦身体积
+          # -extldflags '-static'：强化静态链接
+          # -trimpath：移除编译路径信息，进一步精简
+          # 版本注入：兼容无代码变量的情况，参数格式严格匹配linker要求
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-          go build -ldflags "\
+          go build -ldflags " \
             -s -w \
             -extldflags '-static' \
-            -X main.version=${BUILD_VERSION} \
-            -X main.commit=${BUILD_COMMIT} \
-            -X main.buildTime=${BUILD_TIME} \
+            -X main.version=${{ github.ref_name || 'dev' }} \
+            -X main.commit=${{ github.sha }} \
+            -X 'main.buildTime=$(date +"%Y-%m-%d %H:%M:%S")' \
           " -trimpath -o "${BIN_PATH}" main.go
 
-          # 验证编译结果
-          ls -lh ../bin/
-          file "${BIN_PATH}"
+          # 验证产物（完全匹配原Rust流程的验证逻辑）
+          ls -lh bin/
+          if [ ! -f "$BIN_PATH" ]; then
+            echo "FATAL: 二进制文件未生成！"
+            exit 1
+          fi
+          # 验证静态链接（Go CGO_ENABLED=0 默认纯静态，保留原提示逻辑）
+          file "$BIN_PATH" | grep -qi "statically linked" || {
+            echo "WARNING: 未完全静态链接，但仍可运行"
+            file "$BIN_PATH"
+          }
+          # 编译后strip进一步瘦身（匹配原Rust流程的strip步骤）
+          strip --strip-all "$BIN_PATH"
+          echo "✅ 静态编译成功（已strip）"
 
-      - name: 验证二进制可执行性
+      # 验证原始二进制可运行（完全匹配原Rust流程逻辑，替换二进制名）
+      - name: Verify Original Binary Runability
         run: |
-          chmod +x bin/rdp_ssh_manager
-          # 打印版本/帮助（如果你的程序支持）
-          ./bin/rdp_ssh_manager --version || echo "二进制文件生成成功（无--version参数）"
+          set -euo pipefail
+          BIN_NAME="rdp_ssh_manager"
+          BIN_PATH="bin/${BIN_NAME}"
 
-      - name: 上传编译产物
+          chmod +x "$BIN_PATH"
+          echo "=== 测试原始二进制基础功能 ==="
+          if ! "$BIN_PATH" -h > /dev/null 2>&1; then
+            echo "ERROR: 原始二进制运行失败！"
+            "$BIN_PATH" -h 2>&1
+            exit 1
+          fi
+          echo "✅ 原始二进制运行测试通过"
+
+      # UPX压缩（完全复用原Rust流程逻辑，仅替换二进制路径）
+      - name: Compress Binary with UPX-UCL
+        id: upx_compress
+        run: |
+          set -euo pipefail
+          BIN_NAME="rdp_ssh_manager"
+          BIN_PATH="bin/${BIN_NAME}"
+          
+          # 先备份原始二进制（防止压缩失败）
+          cp "$BIN_PATH" "${BIN_PATH}.backup"
+          
+          # 记录压缩前体积
+          echo "=== UPX压缩前体积 ==="
+          ls -lh "$BIN_PATH"
+          ORIG_SIZE=$(du -b "$BIN_PATH" | awk '{print $1}')
+          
+          # 原Rust流程的UPX参数，完全复用（兼顾兼容性和压缩率）
+          upx --best --lzma --force --strip-relocs=0 -q "$BIN_PATH" || {
+            echo "WARNING: UPX压缩失败，使用原始二进制"
+            cp "${BIN_PATH}.backup" "$BIN_PATH"
+            echo "compressed=false" >> $GITHUB_OUTPUT
+            exit 0
+          }
+          
+          # 记录压缩后体积
+          echo "=== UPX压缩后体积 ==="
+          ls -lh "$BIN_PATH"
+          COMP_SIZE=$(du -b "$BIN_PATH" | awk '{print $1}')
+          COMP_RATIO=$(echo "scale=2; $COMP_SIZE/$ORIG_SIZE*100" | bc)
+          echo "压缩率: ${COMP_RATIO}% (原始: $ORIG_SIZE 字节, 压缩后: $COMP_SIZE 字节)"
+          
+          # 清理备份
+          rm -f "${BIN_PATH}.backup"
+          echo "compressed=true" >> $GITHUB_OUTPUT
+          echo "✅ UPX压缩完成"
+
+      # 验证压缩后二进制可运行（完全复用原Rust流程的回滚逻辑）
+      - name: Verify Compressed Binary Runability
+        run: |
+          set -euo pipefail
+          BIN_NAME="rdp_ssh_manager"
+          BIN_PATH="bin/${BIN_NAME}"
+          BACKUP_PATH="${BIN_PATH}.backup"
+
+          chmod +x "$BIN_PATH"
+          echo "=== 测试UPX压缩后二进制基础功能 ==="
+          if ! "$BIN_PATH" -h > /dev/null 2>&1; then
+            echo "WARNING: 压缩后二进制运行失败，回滚到原始二进制"
+            # 回滚到备份的原始二进制
+            if [ -f "$BACKUP_PATH" ]; then
+              cp "$BACKUP_PATH" "$BIN_PATH"
+            fi
+            # 重新验证原始二进制
+            if ! "$BIN_PATH" -h > /dev/null 2>&1; then
+              echo "ERROR: 原始二进制也无法运行！"
+              "$BIN_PATH" -h 2>&1
+              exit 1
+            fi
+            echo "✅ 已回滚到原始二进制，运行测试通过"
+          else
+            echo "✅ 压缩后二进制运行测试通过"
+          fi
+          # 清理备份
+          rm -f "$BACKUP_PATH"
+
+      # 打包（完全复用原Rust流程的Tag/非Tag区分逻辑，替换二进制名）
+      - name: Package (RDP_SSH_Manager Naming)
+        id: package
+        run: |
+          set -euo pipefail
+          # 确保release目录始终存在
+          mkdir -p release
+          BIN_NAME="rdp_ssh_manager"
+          
+          # 区分tag和非tag场景的命名规则（完全复用原Rust流程逻辑）
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            # Tag推送（正式版本）
+            VERSION="${{ github.ref_name }}"
+            # 根据压缩状态调整文件名
+            if [ "${{ steps.upx_compress.outputs.compressed }}" == "false" ]; then
+              FINAL_BIN="rdp_ssh_manager-${VERSION}-linux-x86_64-static"
+            else
+              FINAL_BIN="rdp_ssh_manager-${VERSION}-linux-x86_64-static-upx"
+            fi
+          else
+            # 非Tag推送（开发版本）
+            COMMIT_SHA="${{ github.sha }}"
+            SHORT_SHA="${COMMIT_SHA:0:8}"  # 取前8位短SHA
+            if [ "${{ steps.upx_compress.outputs.compressed }}" == "false" ]; then
+              FINAL_BIN="rdp_ssh_manager-dev-${SHORT_SHA}-linux-x86_64-static"
+            else
+              FINAL_BIN="rdp_ssh_manager-dev-${SHORT_SHA}-linux-x86_64-static-upx"
+            fi
+            VERSION="dev-${SHORT_SHA}"
+          fi
+          
+          # 复制二进制文件（无论是否tag都执行）
+          cp bin/${BIN_NAME} release/${FINAL_BIN}
+          chmod +x release/${FINAL_BIN}
+          # 生成校验和（无论是否tag都执行，完全复用原逻辑）
+          sha256sum release/${FINAL_BIN} | awk '{print $1 "  " $2}' > release/${FINAL_BIN}.sha256
+
+          # 输出变量（统一格式，完全复用原逻辑）
+          echo "final_bin=release/${FINAL_BIN}" >> $GITHUB_OUTPUT
+          echo "final_sum=release/${FINAL_BIN}.sha256" >> $GITHUB_OUTPUT
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
+          # 打印最终产物信息
+          echo "=== 最终产物 ==="
+          ls -lh release/
+          cat release/${FINAL_BIN}.sha256
+
+      # 上传Artifact（完全复用原Rust流程逻辑，仅替换名称前缀）
+      - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: rdp_ssh_manager-linux-amd64
-          path: bin/rdp_ssh_manager
+          name: rdp_ssh_manager-linux-x86_64-static-${{ steps.package.outputs.version }}
+          path: release/
           retention-days: 30
-          if-no-files-found: error
+          if-no-files-found: error  # 改为error，确保有文件才继续
+
+      # 发布到GitHub Releases（仅Tag推送时执行，完全复用原Rust流程逻辑）
+      - name: Publish to GitHub Releases
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # 验证gh权限
+          gh auth status
+          # 验证文件存在
+          if [ ! -f "${{ steps.package.outputs.final_bin }}" ] || [ ! -f "${{ steps.package.outputs.final_sum }}" ]; then
+            echo "FATAL: Release files missing!"
+            ls -lh release/
+            exit 1
+          fi
+          # 根据压缩状态调整标题（完全复用原逻辑）
+          if [ "${{ steps.upx_compress.outputs.compressed }}" == "false" ]; then
+            RELEASE_TITLE="Release ${{ steps.package.outputs.version }} (Static Binary)"
+          else
+            RELEASE_TITLE="Release ${{ steps.package.outputs.version }} (Static Binary, UPX Compressed)"
+          fi
+          # 创建Release（完全复用原Rust流程的gh命令）
+          gh release create ${{ steps.package.outputs.version }} \
+            --title "$RELEASE_TITLE" \
+            --generate-notes \
+            --repo ${{ github.repository }} \
+            ${{ steps.package.outputs.final_bin }} \
+            ${{ steps.package.outputs.final_sum }}
+          # 验证发布
+          echo "✅ Release published successfully!"
+          gh release view ${{ steps.package.outputs.version }} --repo ${{ github.repository }} --json assets --jq '.assets[].name'
