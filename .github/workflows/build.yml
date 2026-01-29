@@ -255,3 +255,7 @@ jobs:
           # 验证发布结果
           echo "✅ Release发布成功！"
           gh release view ${{ steps.package.outputs.version }} --repo ${{ github.repository }} --json assets --jq '.assets[].name'
+
+
+
+          
