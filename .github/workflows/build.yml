@@ -43,17 +43,31 @@ jobs:
           upx --version || echo "UPX版本检查完成"
           echo "✅ 系统依赖安装成功（包含UPX）"
 
-      # 核心修复：删除无效cd命令，使用当前工作目录相对路径，避免权限问题
+      # ========== 新增核心步骤：初始化Go Module并整理第三方依赖 ==========
+      - name: Initialize Go Module & Tidy Dependencies
+        run: |
+          set -euo pipefail
+          # 初始化Go Module（替换为你的实际GitHub仓库地址，可自定义）
+          MODULE_NAME="github.com/mtl-123/rdp_ssh_manager"
+          if [ ! -f "go.mod" ]; then
+            go mod init ${MODULE_NAME}
+            echo "✅ 已初始化Go Module: ${MODULE_NAME}"
+          fi
+          # 自动整理依赖：拉取缺失的第三方包、清理无用依赖、生成go.sum
+          go mod tidy
+          echo "✅ 第三方依赖整理完成，已生成/更新go.sum"
+          # 打印依赖列表，便于调试
+          go list -m all
+
+      # 静态编译（保留原逻辑，无需额外修改）
       - name: Build Static Binary
         run: |
           set -euo pipefail
           BIN_NAME="rdp_ssh_manager"
-          BIN_PATH="bin/${BIN_NAME}"  # 直接在当前工作目录创建bin，无跨目录权限问题
+          BIN_PATH="bin/${BIN_NAME}"
 
-          # 创建输出目录（当前工作目录，普通用户有完整权限）
           mkdir -p bin
           
-          # 修复ldflags语法，注入版本/提交/构建时间（兼容无代码变量）
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
           go build -ldflags " \
             -s -w \
@@ -63,7 +77,6 @@ jobs:
             -X 'main.buildTime=$(date +"%Y-%m-%d %H:%M:%S")' \
           " -trimpath -o "${BIN_PATH}" main.go
 
-          # 验证产物
           ls -lh bin/
           if [ ! -f "$BIN_PATH" ]; then
             echo "FATAL: 二进制文件未生成！"
